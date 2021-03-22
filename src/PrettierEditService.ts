@@ -5,8 +5,8 @@ import {
   DocumentFilter,
   languages,
   Range,
-  Selection,
   TextDocument,
+  TextDocumentWillSaveEvent,
   TextEdit,
   TextEditor,
   Uri,
@@ -40,17 +40,7 @@ import {
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import * as cp from "child_process";
-
-const execShell = (cmd: string) =>
-  new Promise<string>((resolve, reject) => {
-    cp.exec(cmd, (err, out) => {
-      if (err) {
-        return reject(err);
-      }
-      return resolve(out);
-    });
-  });
+import { CancellationTokenSource } from "vscode";
 
 interface ISelectors {
   rangeLanguageSelector: ReadonlyArray<DocumentFilter>;
@@ -79,6 +69,7 @@ export default class PrettierEditService implements Disposable {
   private formatterHandler: undefined | Disposable;
   private rangeFormatterHandler: undefined | Disposable;
   private registeredWorkspaces = new Set<string>();
+  private globalEditProvider?: PrettierEditProvider = undefined;
 
   constructor(
     private moduleResolver: ModuleResolver,
@@ -118,7 +109,11 @@ export default class PrettierEditService implements Disposable {
       this.handleTextDocumentOpened
     );
 
-    const textDocumentSave = workspace.onDidSaveTextDocument(
+    const textDocumentSave = workspace.onWillSaveTextDocument(
+      this.handleTextDocumentWillBeSaved
+    );
+
+    const textDocumentSaved = workspace.onDidSaveTextDocument(
       this.handleTextDocumentSaved
     );
 
@@ -131,6 +126,7 @@ export default class PrettierEditService implements Disposable {
       textEditorChange,
       textDocumentOpen,
       textDocumentSave,
+      textDocumentSaved,
     ];
   }
 
@@ -153,29 +149,22 @@ export default class PrettierEditService implements Disposable {
     this.loggingService.logInfo("Formatted locally");
   };
 
+  private handleTextDocumentWillBeSaved = async (
+    event: TextDocumentWillSaveEvent
+  ) => {
+    const cts = new CancellationTokenSource();
+    if (this.globalEditProvider)
+      event.waitUntil(
+        this.globalEditProvider.provideDocumentFormattingEdits(
+          event.document,
+          { tabSize: 4, insertSpaces: true },
+          cts.token
+        )
+      );
+  };
+
   private handleTextDocumentSaved = async (textDocument: TextDocument) => {
-    // saving position for future use
-    const editor = window.activeTextEditor;
-    let position = undefined;
-    if (editor?.selection.isEmpty) {
-      position = editor.selection.active;
-    }
-    // reformatting the file
-    const path = textDocument.uri.fsPath;
-    this.loggingService.logInfo("Saved " + path);
-    try {
-      await execShell('prettier.cmd --write "' + path + '"');
-    } catch (e) {
-      window.showErrorMessage(e);
-    }
-    this.loggingService.logInfo("Formatted " + path);
     await commands.executeCommand("editor.action.formatDocument");
-    this.loggingService.logInfo("Formatting");
-    await commands.executeCommand("editor.action.formatDocument");
-    this.loggingService.logInfo("Formatted locally");
-    // restoring the position
-    if (position && window.activeTextEditor)
-      window.activeTextEditor.selection = new Selection(position, position);
   };
 
   private handleActiveTextEditorChanged = async (
@@ -227,7 +216,11 @@ export default class PrettierEditService implements Disposable {
 
     if (!isRegistered) {
       this.statusBar.update(FormatterStatus.Loading);
-      const editProvider = new PrettierEditProvider(this.provideEdits);
+      const editProvider = new PrettierEditProvider(true, this.provideEdits);
+      this.globalEditProvider = new PrettierEditProvider(
+        false,
+        this.provideEdits
+      );
       this.rangeFormatterHandler = languages.registerDocumentRangeFormattingEditProvider(
         rangeLanguageSelector,
         editProvider
@@ -334,10 +327,16 @@ export default class PrettierEditService implements Disposable {
 
   private provideEdits = async (
     document: TextDocument,
+    useLocalConfig: boolean,
     options?: RangeFormattingOptions
   ): Promise<TextEdit[]> => {
     const hrStart = process.hrtime();
-    const result = await this.format(document.getText(), document, options);
+    const result = await this.format(
+      document.getText(),
+      document,
+      useLocalConfig,
+      options
+    );
     if (!result) {
       // No edits happened, return never so VS Code can try other formatters
       return [];
@@ -358,6 +357,7 @@ export default class PrettierEditService implements Disposable {
   private async format(
     text: string,
     { fileName, languageId, uri, isUntitled }: TextDocument,
+    useLocalConfig: boolean,
     rangeFormattingOptions?: RangeFormattingOptions
   ): Promise<string | undefined> {
     this.loggingService.logInfo(`Formatting ${fileName}`);
@@ -445,7 +445,8 @@ export default class PrettierEditService implements Disposable {
     let configPath: string | undefined;
     try {
       const userConfigPath = path.join(os.homedir(), ".prettierrc_user");
-      if (fs.existsSync(userConfigPath)) configPath = userConfigPath;
+      if (useLocalConfig && fs.existsSync(userConfigPath))
+        configPath = userConfigPath;
       else
         configPath = (await prettier.resolveConfigFile(fileName)) ?? undefined;
     } catch (error) {
