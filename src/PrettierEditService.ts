@@ -5,6 +5,7 @@ import {
   DocumentFilter,
   languages,
   Range,
+  Selection,
   TextDocument,
   TextEdit,
   TextEditor,
@@ -153,6 +154,13 @@ export default class PrettierEditService implements Disposable {
   };
 
   private handleTextDocumentSaved = async (textDocument: TextDocument) => {
+    // saving position for future use
+    const editor = window.activeTextEditor;
+    let position = undefined;
+    if (editor?.selection.isEmpty) {
+      position = editor.selection.active;
+    }
+    // reformatting the file
     const path = textDocument.uri.fsPath;
     this.loggingService.logInfo("Saved " + path);
     try {
@@ -165,6 +173,9 @@ export default class PrettierEditService implements Disposable {
     this.loggingService.logInfo("Formatting");
     await commands.executeCommand("editor.action.formatDocument");
     this.loggingService.logInfo("Formatted locally");
+    // restoring the position
+    if (position && window.activeTextEditor)
+      window.activeTextEditor.selection = new Selection(position, position);
   };
 
   private handleActiveTextEditorChanged = async (
