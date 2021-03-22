@@ -1,5 +1,6 @@
 import * as prettier from "prettier";
 import {
+  commands,
   Disposable,
   DocumentFilter,
   languages,
@@ -35,6 +36,20 @@ import {
   getWorkspaceRelativePath,
   isDefaultFormatterOrUnset,
 } from "./util";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
+import * as cp from "child_process";
+
+const execShell = (cmd: string) =>
+  new Promise<string>((resolve, reject) => {
+    cp.exec(cmd, (err, out) => {
+      if (err) {
+        return reject(err);
+      }
+      return resolve(out);
+    });
+  });
 
 interface ISelectors {
   rangeLanguageSelector: ReadonlyArray<DocumentFilter>;
@@ -98,6 +113,14 @@ export default class PrettierEditService implements Disposable {
       this.handleActiveTextEditorChanged
     );
 
+    const textDocumentOpen = workspace.onDidOpenTextDocument(
+      this.handleTextDocumentOpened
+    );
+
+    const textDocumentSave = workspace.onDidSaveTextDocument(
+      this.handleTextDocumentSaved
+    );
+
     this.handleActiveTextEditorChanged(window.activeTextEditor);
 
     return [
@@ -105,6 +128,8 @@ export default class PrettierEditService implements Disposable {
       configurationWatcher,
       prettierConfigWatcher,
       textEditorChange,
+      textDocumentOpen,
+      textDocumentSave,
     ];
   }
 
@@ -119,6 +144,27 @@ export default class PrettierEditService implements Disposable {
       this.registeredWorkspaces.clear();
     }
     this.statusBar.update(FormatterStatus.Ready);
+  };
+
+  private handleTextDocumentOpened = async () => {
+    this.loggingService.logInfo("Formatting");
+    await commands.executeCommand("editor.action.formatDocument");
+    this.loggingService.logInfo("Formatted locally");
+  };
+
+  private handleTextDocumentSaved = async (textDocument: TextDocument) => {
+    const path = textDocument.uri.fsPath;
+    this.loggingService.logInfo("Saved " + path);
+    try {
+      await execShell('prettier.cmd --write "' + path + '"');
+    } catch (e) {
+      window.showErrorMessage(e);
+    }
+    this.loggingService.logInfo("Formatted " + path);
+    await commands.executeCommand("editor.action.formatDocument");
+    this.loggingService.logInfo("Formatting");
+    await commands.executeCommand("editor.action.formatDocument");
+    this.loggingService.logInfo("Formatted locally");
   };
 
   private handleActiveTextEditorChanged = async (
@@ -213,6 +259,8 @@ export default class PrettierEditService implements Disposable {
     } else {
       this.statusBar.hide();
     }
+
+    this.loggingService.logInfo("Switched to " + textEditor.document.uri);
   };
 
   public dispose = () => {
@@ -385,7 +433,10 @@ export default class PrettierEditService implements Disposable {
 
     let configPath: string | undefined;
     try {
-      configPath = (await prettier.resolveConfigFile(fileName)) ?? undefined;
+      const userConfigPath = path.join(os.homedir(), ".prettierrc_user");
+      if (fs.existsSync(userConfigPath)) configPath = userConfigPath;
+      else
+        configPath = (await prettier.resolveConfigFile(fileName)) ?? undefined;
     } catch (error) {
       this.loggingService.logError(
         `Error resolving prettier configuration for ${fileName}`,
