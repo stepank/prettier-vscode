@@ -66,9 +66,12 @@ const PRETTIER_CONFIG_FILES = [
 ];
 
 export default class PrettierEditService implements Disposable {
+  private readonly userConfigPath = path.join(os.homedir(), ".prettierrc_user");
+
   private formatterHandler: undefined | Disposable;
   private rangeFormatterHandler: undefined | Disposable;
   private registeredWorkspaces = new Set<string>();
+  private userEditProvider?: PrettierEditProvider = undefined;
   private globalEditProvider?: PrettierEditProvider = undefined;
 
   constructor(
@@ -144,9 +147,7 @@ export default class PrettierEditService implements Disposable {
   };
 
   private handleTextDocumentOpened = async () => {
-    this.loggingService.logInfo("Formatting");
     await commands.executeCommand("editor.action.formatDocument");
-    this.loggingService.logInfo("Formatted locally");
   };
 
   private handleTextDocumentWillBeSaved = async (
@@ -192,6 +193,25 @@ export default class PrettierEditService implements Disposable {
       workspaceFolder?.uri.fsPath ?? "global"
     );
 
+    const autoSaveMode = workspace
+      .getConfiguration()
+      .get<string>("files.autoSave");
+    const autoSaveAfterDelay = autoSaveMode == "afterDelay";
+
+    if (autoSaveAfterDelay && this.userConfigAvailable())
+      window.showWarningMessage(
+        "User config was found at " +
+          this.userConfigPath +
+          ". At the same time, auto save is set to afterDelay. " +
+          "This combination is known to not work well, so user config will be ignored. " +
+          "To stop this warning from appearing, " +
+          "remove the user config, switch auto save to another mode, or disable auto save."
+      );
+
+    const useUserConfig = !autoSaveAfterDelay;
+    if (this.userEditProvider)
+      this.userEditProvider.setUseUserConfig(useUserConfig);
+
     // Already registered and no instances means that the user
     // already blocked the execution so we don't do anything
     if (isRegistered && !prettierInstance) {
@@ -216,18 +236,21 @@ export default class PrettierEditService implements Disposable {
 
     if (!isRegistered) {
       this.statusBar.update(FormatterStatus.Loading);
-      const editProvider = new PrettierEditProvider(true, this.provideEdits);
+      this.userEditProvider = new PrettierEditProvider(
+        useUserConfig,
+        this.provideEdits
+      );
       this.globalEditProvider = new PrettierEditProvider(
         false,
         this.provideEdits
       );
       this.rangeFormatterHandler = languages.registerDocumentRangeFormattingEditProvider(
         rangeLanguageSelector,
-        editProvider
+        this.userEditProvider
       );
       this.formatterHandler = languages.registerDocumentFormattingEditProvider(
         languageSelector,
-        editProvider
+        this.userEditProvider
       );
       this.registeredWorkspaces.add(workspaceFolder?.uri.fsPath ?? "global");
 
@@ -327,14 +350,14 @@ export default class PrettierEditService implements Disposable {
 
   private provideEdits = async (
     document: TextDocument,
-    useLocalConfig: boolean,
+    useUserConfig: boolean,
     options?: RangeFormattingOptions
   ): Promise<TextEdit[]> => {
     const hrStart = process.hrtime();
     const result = await this.format(
       document.getText(),
       document,
-      useLocalConfig,
+      useUserConfig,
       options
     );
     if (!result) {
@@ -444,9 +467,8 @@ export default class PrettierEditService implements Disposable {
 
     let configPath: string | undefined;
     try {
-      const userConfigPath = path.join(os.homedir(), ".prettierrc_user");
-      if (useLocalConfig && fs.existsSync(userConfigPath))
-        configPath = userConfigPath;
+      if (useLocalConfig && this.userConfigAvailable())
+        configPath = this.userConfigPath;
       else
         configPath = (await prettier.resolveConfigFile(fileName)) ?? undefined;
     } catch (error) {
@@ -496,6 +518,10 @@ export default class PrettierEditService implements Disposable {
 
       return text;
     }
+  }
+
+  private userConfigAvailable(): boolean {
+    return fs.existsSync(this.userConfigPath);
   }
 
   private fullDocumentRange(document: TextDocument): Range {

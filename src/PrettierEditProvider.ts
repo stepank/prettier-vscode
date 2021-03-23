@@ -15,13 +15,17 @@ export class PrettierEditProvider
     DocumentRangeFormattingEditProvider,
     DocumentFormattingEditProvider {
   constructor(
-    private useLocalConfig: boolean,
+    private useUserConfig: boolean,
     private provideEdits: (
       document: TextDocument,
-      useLocalConfig: boolean,
+      useUserConfig: boolean,
       options?: RangeFormattingOptions
     ) => Promise<TextEdit[]>
   ) {}
+
+  public setUseUserConfig(value: boolean): void {
+    this.useUserConfig = value;
+  }
 
   public async provideDocumentRangeFormattingEdits(
     document: TextDocument,
@@ -31,7 +35,7 @@ export class PrettierEditProvider
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     token: CancellationToken
   ): Promise<TextEdit[]> {
-    return this.provideEdits(document, this.useLocalConfig, {
+    return this.provideEdits(document, this.useUserConfig, {
       rangeEnd: document.offsetAt(range.end),
       rangeStart: document.offsetAt(range.start),
     });
@@ -44,6 +48,6 @@ export class PrettierEditProvider
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     token: CancellationToken
   ): Promise<TextEdit[]> {
-    return this.provideEdits(document, this.useLocalConfig);
+    return this.provideEdits(document, this.useUserConfig);
   }
 }
