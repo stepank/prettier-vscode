@@ -47,6 +47,8 @@ interface ISelectors {
   languageSelector: ReadonlyArray<DocumentFilter>;
 }
 
+const USER_CONFIG_PATH = path.join(os.homedir(), ".prettierrc_user");
+
 /**
  * Prettier reads configuration from files
  */
@@ -66,13 +68,14 @@ const PRETTIER_CONFIG_FILES = [
 ];
 
 export default class PrettierEditService implements Disposable {
-  private readonly userConfigPath = path.join(os.homedir(), ".prettierrc_user");
-
   private formatterHandler: undefined | Disposable;
   private rangeFormatterHandler: undefined | Disposable;
   private registeredWorkspaces = new Set<string>();
+  private autoSaveAfterDelay = false;
+  private userConfigAvailable = false;
+  private useUserConfig = false;
   private userEditProvider?: PrettierEditProvider = undefined;
-  private globalEditProvider?: PrettierEditProvider = undefined;
+  private projectEditProvider?: PrettierEditProvider = undefined;
 
   constructor(
     private moduleResolver: ModuleResolver,
@@ -108,11 +111,11 @@ export default class PrettierEditService implements Disposable {
       this.handleActiveTextEditorChanged
     );
 
-    const textDocumentOpen = workspace.onDidOpenTextDocument(
+    const textDocumentOpened = workspace.onDidOpenTextDocument(
       this.handleTextDocumentOpened
     );
 
-    const textDocumentSave = workspace.onWillSaveTextDocument(
+    const textDocumentWillBeSaved = workspace.onWillSaveTextDocument(
       this.handleTextDocumentWillBeSaved
     );
 
@@ -127,8 +130,8 @@ export default class PrettierEditService implements Disposable {
       configurationWatcher,
       prettierConfigWatcher,
       textEditorChange,
-      textDocumentOpen,
-      textDocumentSave,
+      textDocumentOpened,
+      textDocumentWillBeSaved,
       textDocumentSaved,
     ];
   }
@@ -147,25 +150,31 @@ export default class PrettierEditService implements Disposable {
   };
 
   private handleTextDocumentOpened = async () => {
-    await commands.executeCommand("editor.action.formatDocument");
+    this.checkIfUserConfigIsUsed();
+    if (this.useUserConfig)
+      await commands.executeCommand("editor.action.formatDocument");
   };
 
   private handleTextDocumentWillBeSaved = async (
     event: TextDocumentWillSaveEvent
   ) => {
-    const cts = new CancellationTokenSource();
-    if (this.globalEditProvider)
+    this.checkIfUserConfigIsUsed();
+    if (this.projectEditProvider && this.useUserConfig) {
+      const cts = new CancellationTokenSource();
       event.waitUntil(
-        this.globalEditProvider.provideDocumentFormattingEdits(
+        this.projectEditProvider.provideDocumentFormattingEdits(
           event.document,
           { tabSize: 4, insertSpaces: true },
           cts.token
         )
       );
+    }
   };
 
   private handleTextDocumentSaved = async (textDocument: TextDocument) => {
-    await commands.executeCommand("editor.action.formatDocument");
+    this.checkIfUserConfigIsUsed();
+    if (this.useUserConfig)
+      await commands.executeCommand("editor.action.formatDocument");
   };
 
   private handleActiveTextEditorChanged = async (
@@ -193,24 +202,21 @@ export default class PrettierEditService implements Disposable {
       workspaceFolder?.uri.fsPath ?? "global"
     );
 
-    const autoSaveMode = workspace
-      .getConfiguration()
-      .get<string>("files.autoSave");
-    const autoSaveAfterDelay = autoSaveMode == "afterDelay";
+    this.checkIfUserConfigIsUsed();
 
-    if (autoSaveAfterDelay && this.userConfigAvailable())
+    if (
+      !this.useUserConfig &&
+      this.userConfigAvailable &&
+      this.autoSaveAfterDelay
+    )
       window.showWarningMessage(
         "User config was found at " +
-          this.userConfigPath +
+          USER_CONFIG_PATH +
           ". At the same time, auto save is set to afterDelay. " +
           "This combination is known to not work well, so user config will be ignored. " +
           "To stop this warning from appearing, " +
           "remove the user config, switch auto save to another mode, or disable auto save."
       );
-
-    const useUserConfig = !autoSaveAfterDelay;
-    if (this.userEditProvider)
-      this.userEditProvider.setUseUserConfig(useUserConfig);
 
     // Already registered and no instances means that the user
     // already blocked the execution so we don't do anything
@@ -236,14 +242,16 @@ export default class PrettierEditService implements Disposable {
 
     if (!isRegistered) {
       this.statusBar.update(FormatterStatus.Loading);
+
       this.userEditProvider = new PrettierEditProvider(
-        useUserConfig,
+        this.useUserConfig,
         this.provideEdits
       );
-      this.globalEditProvider = new PrettierEditProvider(
+      this.projectEditProvider = new PrettierEditProvider(
         false,
         this.provideEdits
       );
+
       this.rangeFormatterHandler = languages.registerDocumentRangeFormattingEditProvider(
         rangeLanguageSelector,
         this.userEditProvider
@@ -380,7 +388,7 @@ export default class PrettierEditService implements Disposable {
   private async format(
     text: string,
     { fileName, languageId, uri, isUntitled }: TextDocument,
-    useLocalConfig: boolean,
+    useUserConfig: boolean,
     rangeFormattingOptions?: RangeFormattingOptions
   ): Promise<string | undefined> {
     this.loggingService.logInfo(`Formatting ${fileName}`);
@@ -467,8 +475,7 @@ export default class PrettierEditService implements Disposable {
 
     let configPath: string | undefined;
     try {
-      if (useLocalConfig && this.userConfigAvailable())
-        configPath = this.userConfigPath;
+      if (useUserConfig) configPath = USER_CONFIG_PATH;
       else
         configPath = (await prettier.resolveConfigFile(fileName)) ?? undefined;
     } catch (error) {
@@ -520,8 +527,15 @@ export default class PrettierEditService implements Disposable {
     }
   }
 
-  private userConfigAvailable(): boolean {
-    return fs.existsSync(this.userConfigPath);
+  private checkIfUserConfigIsUsed(): void {
+    const autoSaveMode = workspace
+      .getConfiguration()
+      .get<string>("files.autoSave");
+    this.autoSaveAfterDelay = autoSaveMode == "afterDelay";
+    this.userConfigAvailable = fs.existsSync(USER_CONFIG_PATH);
+    this.useUserConfig = !this.autoSaveAfterDelay && this.userConfigAvailable;
+    if (this.userEditProvider)
+      this.userEditProvider.setUseUserConfig(this.useUserConfig);
   }
 
   private fullDocumentRange(document: TextDocument): Range {
