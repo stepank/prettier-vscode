@@ -294,8 +294,6 @@ export default class PrettierEditService implements Disposable {
     } else {
       this.statusBar.hide();
     }
-
-    this.loggingService.logInfo("Switched to " + textEditor.document.uri);
   };
 
   public dispose = () => {
