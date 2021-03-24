@@ -4,7 +4,9 @@ import {
   Disposable,
   DocumentFilter,
   languages,
+  Position,
   Range,
+  Selection,
   TextDocument,
   TextEdit,
   TextEditor,
@@ -81,13 +83,15 @@ export default class PrettierEditService implements Disposable {
   private formatterHandler: undefined | Disposable;
   private rangeFormatterHandler: undefined | Disposable;
   private registeredWorkspaces = new Set<string>();
-  private autoSaveAfterDelay = false;
-  private userConfigAvailable = false;
   private useUserConfig = false;
   private userEditProvider?: PrettierEditProvider = undefined;
   private lastActiveTextEditor?: TextEditor = undefined;
   private visitedFiles: {
-    [filePath: string]: { position: number; isDirty: boolean };
+    [filePath: string]: {
+      position: Position;
+      visibleRanges: Range[];
+      isDirty: boolean;
+    };
   } = {};
 
   constructor(
@@ -162,47 +166,73 @@ export default class PrettierEditService implements Disposable {
     this.statusBar.update(FormatterStatus.Ready);
   };
 
-  private handleTextDocumentOpened = async (document: TextDocument) => {
+  private handleTextDocumentOpened = async (textDocument: TextDocument) => {
+    if (textDocument.uri.scheme !== "file") return;
+
     this.checkIfUserConfigIsUsed();
     if (!this.useUserConfig) return;
 
-    if (!document.isDirty) {
-      await commands.executeCommand("editor.action.formatDocument");
-      await commands.executeCommand("workbench.action.files.save");
-    }
+    await commands.executeCommand("editor.action.formatDocument");
+    await commands.executeCommand("workbench.action.files.save");
   };
 
   private handleTextDocumentSaved = async (textDocument: TextDocument) => {
+    if (textDocument.uri.scheme !== "file") return;
+
     this.checkIfUserConfigIsUsed();
     if (!this.useUserConfig) return;
 
     const filePath = textDocument.uri.fsPath;
-    this.visitedFiles[filePath] = { position: 0, isDirty: false };
+    const fileState = this.visitedFiles[filePath];
+    if (fileState) this.visitedFiles[filePath].isDirty = false;
   };
 
   private handleWindowStateChanged = async (state: WindowState) => {
-    if (this.lastActiveTextEditor)
-      this.handleLeaveTextEditor(this.lastActiveTextEditor);
-
     this.checkIfUserConfigIsUsed();
     if (!this.useUserConfig) return;
+
+    if (window.activeTextEditor && !state.focused)
+      this.saveTextEditorPosition(window.activeTextEditor);
 
     try {
       for (const filePath in this.visitedFiles) {
         const fileState = this.visitedFiles[filePath];
         if (!fileState.isDirty)
-          await this.formatFileExternally(filePath, !state.focused);
+          await this.formatFileExternally(filePath, state.focused);
       }
     } catch (e) {
       window.showErrorMessage(e);
     }
+
+    if (window.activeTextEditor && state.focused)
+      this.restoreTextEditorPosition(window.activeTextEditor);
   };
 
   private handleLeaveTextEditor = async (textEditor: TextEditor) => {
-    textEditor.document.save();
+    this.checkIfUserConfigIsUsed();
+    if (!this.useUserConfig) return;
+
+    this.saveTextEditorPosition(textEditor);
+  };
+
+  private saveTextEditorPosition = (textEditor: TextEditor) => {
     const filePath = textEditor.document.uri.fsPath;
-    await this.formatFileExternally(filePath, true);
-    this.visitedFiles[filePath] = { position: 0, isDirty: false };
+    this.visitedFiles[filePath] = {
+      position: textEditor.selection.active,
+      visibleRanges: textEditor.visibleRanges,
+      isDirty: textEditor.document.isDirty,
+    };
+  };
+
+  private restoreTextEditorPosition = (textEditor: TextEditor) => {
+    const fileState = this.visitedFiles[textEditor.document.uri.fsPath];
+    if (!fileState || fileState.isDirty) return;
+
+    textEditor.selection = new Selection(
+      fileState.position,
+      fileState.position
+    );
+    textEditor.revealRange(fileState.visibleRanges[0]);
   };
 
   private formatFileExternally = async (
@@ -233,6 +263,8 @@ export default class PrettierEditService implements Disposable {
       this.handleLeaveTextEditor(this.lastActiveTextEditor);
     this.lastActiveTextEditor = textEditor;
 
+    this.handleTextDocumentOpened(textEditor.document);
+
     const prettierInstance = await this.moduleResolver.getPrettierInstance(
       workspaceFolder?.uri.fsPath,
       {
@@ -243,22 +275,6 @@ export default class PrettierEditService implements Disposable {
     const isRegistered = this.registeredWorkspaces.has(
       workspaceFolder?.uri.fsPath ?? "global"
     );
-
-    this.checkIfUserConfigIsUsed();
-
-    if (
-      !this.useUserConfig &&
-      this.userConfigAvailable &&
-      this.autoSaveAfterDelay
-    )
-      window.showWarningMessage(
-        "User config was found at " +
-          USER_CONFIG_PATH +
-          ". At the same time, auto save is set to afterDelay. " +
-          "This combination is known to not work well, so user config will be ignored. " +
-          "To stop this warning from appearing, " +
-          "remove the user config, switch auto save to another mode, or disable auto save."
-      );
 
     // Already registered and no instances means that the user
     // already blocked the execution so we don't do anything
@@ -281,6 +297,8 @@ export default class PrettierEditService implements Disposable {
     const { rangeLanguageSelector, languageSelector } = await this.selectors(
       prettierInstance
     );
+
+    this.checkIfUserConfigIsUsed();
 
     if (!isRegistered) {
       this.statusBar.update(FormatterStatus.Loading);
@@ -564,12 +582,7 @@ export default class PrettierEditService implements Disposable {
   }
 
   private checkIfUserConfigIsUsed(): void {
-    const autoSaveMode = workspace
-      .getConfiguration()
-      .get<string>("files.autoSave");
-    this.autoSaveAfterDelay = autoSaveMode == "afterDelay";
-    this.userConfigAvailable = fs.existsSync(USER_CONFIG_PATH);
-    this.useUserConfig = !this.autoSaveAfterDelay && this.userConfigAvailable;
+    this.useUserConfig = fs.existsSync(USER_CONFIG_PATH);
     if (this.userEditProvider)
       this.userEditProvider.setUseUserConfig(this.useUserConfig);
   }
