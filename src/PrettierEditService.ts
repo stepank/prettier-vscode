@@ -6,11 +6,11 @@ import {
   languages,
   Range,
   TextDocument,
-  TextDocumentWillSaveEvent,
   TextEdit,
   TextEditor,
   Uri,
   window,
+  WindowState,
   workspace,
 } from "vscode";
 import { ConfigResolver, RangeFormattingOptions } from "./ConfigResolver";
@@ -37,10 +37,10 @@ import {
   getWorkspaceRelativePath,
   isDefaultFormatterOrUnset,
 } from "./util";
+import * as cp from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { CancellationTokenSource } from "vscode";
 
 interface ISelectors {
   rangeLanguageSelector: ReadonlyArray<DocumentFilter>;
@@ -67,6 +67,16 @@ const PRETTIER_CONFIG_FILES = [
   ".editorconfig",
 ];
 
+const execShell = (cmd: string) =>
+  new Promise<string>((resolve, reject) => {
+    cp.exec(cmd, (err, out) => {
+      if (err) {
+        return reject(err);
+      }
+      return resolve(out);
+    });
+  });
+
 export default class PrettierEditService implements Disposable {
   private formatterHandler: undefined | Disposable;
   private rangeFormatterHandler: undefined | Disposable;
@@ -75,7 +85,10 @@ export default class PrettierEditService implements Disposable {
   private userConfigAvailable = false;
   private useUserConfig = false;
   private userEditProvider?: PrettierEditProvider = undefined;
-  private projectEditProvider?: PrettierEditProvider = undefined;
+  private lastActiveTextEditor?: TextEditor = undefined;
+  private visitedFiles: {
+    [filePath: string]: { position: number; isDirty: boolean };
+  } = {};
 
   constructor(
     private moduleResolver: ModuleResolver,
@@ -115,12 +128,12 @@ export default class PrettierEditService implements Disposable {
       this.handleTextDocumentOpened
     );
 
-    const textDocumentWillBeSaved = workspace.onWillSaveTextDocument(
-      this.handleTextDocumentWillBeSaved
-    );
-
     const textDocumentSaved = workspace.onDidSaveTextDocument(
       this.handleTextDocumentSaved
+    );
+
+    const windowStateChanged = window.onDidChangeWindowState(
+      this.handleWindowStateChanged
     );
 
     this.handleActiveTextEditorChanged(window.activeTextEditor);
@@ -131,8 +144,8 @@ export default class PrettierEditService implements Disposable {
       prettierConfigWatcher,
       textEditorChange,
       textDocumentOpened,
-      textDocumentWillBeSaved,
       textDocumentSaved,
+      windowStateChanged,
     ];
   }
 
@@ -149,32 +162,56 @@ export default class PrettierEditService implements Disposable {
     this.statusBar.update(FormatterStatus.Ready);
   };
 
-  private handleTextDocumentOpened = async () => {
+  private handleTextDocumentOpened = async (document: TextDocument) => {
     this.checkIfUserConfigIsUsed();
-    if (this.useUserConfig)
-      await commands.executeCommand("editor.action.formatDocument");
-  };
+    if (!this.useUserConfig) return;
 
-  private handleTextDocumentWillBeSaved = async (
-    event: TextDocumentWillSaveEvent
-  ) => {
-    this.checkIfUserConfigIsUsed();
-    if (this.projectEditProvider && this.useUserConfig) {
-      const cts = new CancellationTokenSource();
-      event.waitUntil(
-        this.projectEditProvider.provideDocumentFormattingEdits(
-          event.document,
-          { tabSize: 4, insertSpaces: true },
-          cts.token
-        )
-      );
+    if (!document.isDirty) {
+      await commands.executeCommand("editor.action.formatDocument");
+      await commands.executeCommand("workbench.action.files.save");
     }
   };
 
   private handleTextDocumentSaved = async (textDocument: TextDocument) => {
     this.checkIfUserConfigIsUsed();
-    if (this.useUserConfig)
-      await commands.executeCommand("editor.action.formatDocument");
+    if (!this.useUserConfig) return;
+
+    const filePath = textDocument.uri.fsPath;
+    this.visitedFiles[filePath] = { position: 0, isDirty: false };
+  };
+
+  private handleWindowStateChanged = async (state: WindowState) => {
+    if (this.lastActiveTextEditor)
+      this.handleLeaveTextEditor(this.lastActiveTextEditor);
+
+    this.checkIfUserConfigIsUsed();
+    if (!this.useUserConfig) return;
+
+    try {
+      for (const filePath in this.visitedFiles) {
+        const fileState = this.visitedFiles[filePath];
+        if (!fileState.isDirty)
+          await this.formatFileExternally(filePath, !state.focused);
+      }
+    } catch (e) {
+      window.showErrorMessage(e);
+    }
+  };
+
+  private handleLeaveTextEditor = async (textEditor: TextEditor) => {
+    textEditor.document.save();
+    const filePath = textEditor.document.uri.fsPath;
+    await this.formatFileExternally(filePath, true);
+    this.visitedFiles[filePath] = { position: 0, isDirty: false };
+  };
+
+  private formatFileExternally = async (
+    filePath: string,
+    useUserConfig: boolean
+  ) => {
+    const config = !useUserConfig ? "" : " --config " + USER_CONFIG_PATH;
+    const cmd = "prettier.cmd --write" + config + ' "' + filePath + '"';
+    await execShell(cmd);
   };
 
   private handleActiveTextEditorChanged = async (
@@ -184,12 +221,17 @@ export default class PrettierEditService implements Disposable {
       this.statusBar.hide();
       return;
     }
+
     const { document } = textEditor;
     if (document.uri.scheme !== "file") {
       this.statusBar.hide();
       return;
     }
     const workspaceFolder = workspace.getWorkspaceFolder(document.uri);
+
+    if (this.lastActiveTextEditor)
+      this.handleLeaveTextEditor(this.lastActiveTextEditor);
+    this.lastActiveTextEditor = textEditor;
 
     const prettierInstance = await this.moduleResolver.getPrettierInstance(
       workspaceFolder?.uri.fsPath,
@@ -245,10 +287,6 @@ export default class PrettierEditService implements Disposable {
 
       this.userEditProvider = new PrettierEditProvider(
         this.useUserConfig,
-        this.provideEdits
-      );
-      this.projectEditProvider = new PrettierEditProvider(
-        false,
         this.provideEdits
       );
 
