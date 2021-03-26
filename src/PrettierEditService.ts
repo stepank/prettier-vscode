@@ -70,6 +70,10 @@ const PRETTIER_CONFIG_FILES = [
   ".editorconfig",
 ];
 
+async function sleep(msec: number) {
+  return new Promise((resolve) => setTimeout(resolve, msec));
+}
+
 export default class PrettierEditService implements Disposable {
   private formatterHandler: undefined | Disposable;
   private rangeFormatterHandler: undefined | Disposable;
@@ -170,8 +174,14 @@ export default class PrettierEditService implements Disposable {
     this.checkIfUserConfigIsUsed();
     if (!this.useUserConfig) return;
 
-    await commands.executeCommand("editor.action.formatDocument");
-    await commands.executeCommand("workbench.action.files.save");
+    await PrettierEditService.runWithStatusReporting(
+      async () => {
+        await commands.executeCommand("editor.action.formatDocument");
+        await commands.executeCommand("workbench.action.files.save");
+      },
+      "Formatting the file to user preferences...",
+      "Formatting the file to user preferences done."
+    );
   };
 
   private handleTextDocumentClosed = async (textDocument: TextDocument) => {
@@ -204,25 +214,23 @@ export default class PrettierEditService implements Disposable {
     if (window.activeTextEditor && !state.focused)
       this.saveTextEditorPosition(window.activeTextEditor);
 
-    if (state.focused)
-      window.showInformationMessage("Formatting files to user preferences...");
+    await PrettierEditService.runWithStatusReporting(
+      async () => {
+        const filesToFormat: string[] = [];
+        for (const filePath in this.visitedFiles) {
+          const fileState = this.visitedFiles[filePath];
+          if (!fileState.isDirty && fileState.isOpen) {
+            filesToFormat.push(filePath);
+          }
+        }
+        await this.formatFiles(filesToFormat, state.focused);
 
-    const filesToFormat: string[] = [];
-    for (const filePath in this.visitedFiles) {
-      const fileState = this.visitedFiles[filePath];
-      if (!fileState.isDirty && fileState.isOpen) {
-        filesToFormat.push(filePath);
-      }
-    }
-    await this.formatFiles(filesToFormat, state.focused);
-
-    if (window.activeTextEditor && state.focused)
-      this.restoreTextEditorPosition(window.activeTextEditor);
-
-    if (state.focused)
-      window.showInformationMessage(
-        "Formatting files to user preferences done."
-      );
+        if (window.activeTextEditor && state.focused)
+          this.restoreTextEditorPosition(window.activeTextEditor);
+      },
+      state.focused ? "Formatting files to user preferences..." : undefined,
+      state.focused ? "Formatting files to user preferences done." : undefined
+    );
   };
 
   private handleLeaveTextEditor = async (textEditor: TextEditor) => {
@@ -279,6 +287,26 @@ export default class PrettierEditService implements Disposable {
     for (let i = 0; i < documentsToSave.length; i++) {
       const document = documentsToSave[i];
       await document.save();
+    }
+  };
+
+  private static runWithStatusReporting = async (
+    operation: () => Thenable<any>,
+    statusBefore: string | undefined,
+    statusAfter: string | undefined
+  ) => {
+    let message = undefined;
+
+    if (statusBefore) message = window.setStatusBarMessage(statusBefore);
+
+    await operation();
+
+    message?.dispose();
+
+    if (statusAfter) {
+      message = window.setStatusBarMessage(statusAfter);
+      await sleep(2000);
+      message.dispose();
     }
   };
 
